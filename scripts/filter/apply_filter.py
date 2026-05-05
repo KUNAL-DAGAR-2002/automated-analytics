@@ -1,10 +1,17 @@
-from scripts.filter.country_and_product_filter import country_filter, product_filter
+from scripts.filter.country_and_product_filter import (
+    age_filter,
+    country_filter,
+    gender_filter,
+    product_filter,
+)
 from scripts.filter.date_filter import DateFilter 
 import pandas as pd
 
 filter_map = {
     "product" : product_filter,
     "country" : country_filter,
+    "age": age_filter,
+    "gender": gender_filter,
 }
 
 def apply_filters(df, filters):
