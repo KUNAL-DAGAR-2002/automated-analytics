@@ -36,13 +36,31 @@ st.set_page_config(
 
 
 @st.cache_data
-def load_data() -> pd.DataFrame:
-    df = pd.read_csv(DATA_PATH, encoding="utf-8")
+def load_default_data() -> pd.DataFrame:
+    df = pd.read_csv(DATA_PATH, encoding="utf-8", low_memory=False)
+    return clean_data(df)
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = handle_duplicates(df)
     df = handle_null_values(df)
     df = add_total_price(df)
     return df.dropna(subset=["date"])
+
+
+def validate_columns(df: pd.DataFrame) -> list[str]:
+    required_columns = {
+        "Invoice",
+        "StockCode",
+        "Description",
+        "Quantity",
+        "Price",
+        "Country",
+        "cust_id",
+        "date",
+    }
+    return sorted(required_columns - set(df.columns))
 
 
 def format_currency(value: float) -> str:
@@ -212,6 +230,57 @@ def reset_filters() -> None:
         st.session_state[key] = value
 
 
+def clamp_slider_range(value: tuple[int, int], min_value: int, max_value: int) -> tuple[int, int]:
+    if not isinstance(value, tuple) or len(value) != 2:
+        return (min_value, max_value)
+    start = min(max(int(value[0]), min_value), max_value)
+    end = min(max(int(value[1]), min_value), max_value)
+    return (start, end) if start <= end else (min_value, max_value)
+
+
+def clamp_slider_value(value: int, min_value: int, max_value: int) -> int:
+    try:
+        return min(max(int(value), min_value), max_value)
+    except (TypeError, ValueError):
+        return min_value
+
+
+def sync_filter_state() -> None:
+    valid_tokens = {"between", "more", "less", "equal"}
+
+    if "product_filter" not in st.session_state:
+        st.session_state.product_filter = []
+    else:
+        st.session_state.product_filter = [
+            product for product in st.session_state.product_filter if product in products
+        ]
+
+    if st.session_state.get("country_filter") not in countries:
+        st.session_state.country_filter = "All"
+
+    for filter_type, min_value, max_value in [
+        ("day", day_min, day_max),
+        ("month", month_min, month_max),
+        ("year", year_min, year_max),
+    ]:
+        token_key = f"{filter_type}_token"
+        between_key = f"{filter_type}_between"
+        value_key = f"{filter_type}_value"
+
+        if st.session_state.get(token_key) not in valid_tokens:
+            st.session_state[token_key] = "between"
+        st.session_state[between_key] = clamp_slider_range(
+            st.session_state.get(between_key),
+            min_value,
+            max_value,
+        )
+        st.session_state[value_key] = clamp_slider_value(
+            st.session_state.get(value_key),
+            min_value,
+            max_value,
+        )
+
+
 def date_filter_control(label: str, filter_type: str, min_value: int, max_value: int) -> dict:
     token = st.selectbox(
         f"{label} condition",
@@ -241,10 +310,30 @@ def date_filter_control(label: str, filter_type: str, min_value: int, max_value:
     return {"type": filter_type, "data": data, "token": token}
 
 
-df = load_data()
+st.title("Excel Project Dashboard")
+
+uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+
+if uploaded_file is not None:
+    uploaded_df = pd.read_csv(uploaded_file, encoding="utf-8", low_memory=False)
+    missing_columns = validate_columns(uploaded_df)
+    if missing_columns:
+        st.error(
+            "Uploaded CSV is missing required columns: "
+            + ", ".join(missing_columns)
+        )
+        st.stop()
+    df = clean_data(uploaded_df)
+    st.caption(f"Using uploaded file: {uploaded_file.name}")
+else:
+    df = load_default_data()
+    st.caption("Using default file: data/cleaned_data.csv")
+
 original_df = df.copy()
 
-st.title("Excel Project Dashboard")
+if df.empty:
+    st.error("No usable rows found. Please upload a CSV with valid date values.")
+    st.stop()
 
 day_min = int(df["date"].dt.day.min())
 day_max = int(df["date"].dt.day.max())
@@ -254,6 +343,8 @@ year_min = int(df["date"].dt.year.min())
 year_max = int(df["date"].dt.year.max())
 countries = ["All"] + sorted(df["Country"].dropna().unique().tolist())
 products = sorted(df["Description"].dropna().unique().tolist())
+
+sync_filter_state()
 
 st.button("Remove Filters", on_click=reset_filters)
 
