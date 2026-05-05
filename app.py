@@ -310,7 +310,7 @@ def date_filter_control(label: str, filter_type: str, min_value: int, max_value:
     return {"type": filter_type, "data": data, "token": token}
 
 
-st.title("Excel Project Dashboard")
+st.title("Automated Analytics Dashboard")
 
 uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
