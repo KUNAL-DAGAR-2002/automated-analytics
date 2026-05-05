@@ -30,7 +30,7 @@ DATA_PATH = BASE_DIR / "data" / "cleaned_data.csv"
 
 
 st.set_page_config(
-    page_title="Excel Project Dashboard",
+    page_title="Automated Analytics Dashboard",
     layout="wide",
 )
 
