@@ -1,3 +1,6 @@
+#### Live Demo Link
+https://kunal-dagar-2002-automated-analytics-app-kkesai.streamlit.app/
+
 # Automated Analytics Dashboard
 
 A Streamlit dashboard for quickly analyzing retail/customer transaction data from CSV files. The app supports built-in CSV files from the `data/` folder as well as user-uploaded CSV files, then lets the user map their dataset columns to the app's expected schema.
