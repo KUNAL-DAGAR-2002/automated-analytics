@@ -15,7 +15,9 @@ filter_map = {
 }
 
 def apply_filters(df, filters):
-    df['date'] = pd.to_datetime(df['date'])  # ensure date is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df['date']):
+        df = df.copy(deep=False)
+        df['date'] = pd.to_datetime(df['date'])  # ensure date is datetime
     for i in filters:
         type =i['type']
         data = i['data']

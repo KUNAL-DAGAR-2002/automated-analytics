@@ -1,5 +1,4 @@
 import pandas as pd 
-from scripts.kpi.kpi import average_order_value
 
 
 def metric_wise_average_order_value(df,metric):

@@ -3,7 +3,6 @@ from io import BytesIO
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
 import streamlit as st
 
 from scripts.data_cleaning.calculated_columns import add_age_groups, add_total_price
@@ -44,6 +43,8 @@ REQUIRED_COLUMNS = [
 ]
 UNAVAILABLE_COLUMN = "Column not available in dataset"
 DATA_DIR = Path(__file__).resolve().parent / "data"
+MAX_UPLOAD_SIZE_MB = 50
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 COLUMN_ALIASES = {
     "Invoice": ["Invoice", "Transaction ID", "Order ID", "OrderID", "InvoiceNo"],
     "StockCode": ["StockCode", "Stock Code", "ITEM CODE", "SKU", "Product ID"],
@@ -81,7 +82,22 @@ def read_uploaded_csv(file_bytes: bytes) -> pd.DataFrame:
     return pd.read_csv(BytesIO(file_bytes), encoding="utf-8", low_memory=False)
 
 
+def optimize_dataframe_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast and categorize to keep Render free-tier memory usage low."""
+    for column in df.select_dtypes(include=["integer"]).columns:
+        df[column] = pd.to_numeric(df[column], downcast="integer")
+    for column in df.select_dtypes(include=["floating"]).columns:
+        df[column] = pd.to_numeric(df[column], downcast="float")
+    for column in df.select_dtypes(include=["object"]).columns:
+        nunique = df[column].nunique(dropna=False)
+        if len(df) and nunique / len(df) <= 0.5:
+            df[column] = df[column].astype("category")
+    return df
+
+
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    # Work on one shallow copy so cached raw data is not mutated across reruns.
+    df = df.copy(deep=False)
     if "Description" not in df.columns and "product" in df.columns:
         df["Description"] = df["product"]
     if "product" not in df.columns and "Description" in df.columns:
@@ -96,7 +112,8 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df = handle_null_values(df)
     df = add_total_price(df)
     df = add_age_groups(df)
-    return df.dropna(how="all")
+    df = df.dropna(how="all")
+    return optimize_dataframe_memory(df)
 
 
 def get_data_files() -> list[Path]:
@@ -195,23 +212,23 @@ def get_mapping_signature(mapping: dict[str, str]) -> tuple[tuple[str, str], ...
     return tuple(sorted(mapping.items()))
 
 
+@st.cache_data(show_spinner=False)
 def get_processed_data(
     source_signature: str,
     uploaded_df: pd.DataFrame,
-    column_mapping: dict[str, str],
+    mapping_signature: tuple[tuple[str, str], ...],
 ) -> pd.DataFrame:
-    processing_key = (source_signature, get_mapping_signature(column_mapping))
-    if st.session_state.get("processed_data_key") != processing_key:
-        mapped_df = apply_column_mapping(uploaded_df, column_mapping)
-        missing_columns = validate_columns(mapped_df)
-        if missing_columns:
-            st.error("Please map all required columns before continuing.")
-            st.stop()
+    # Cache preprocessing instead of storing large DataFrames in session_state.
+    del source_signature
+    column_mapping = dict(mapping_signature)
+    mapped_df = apply_column_mapping(uploaded_df, column_mapping)
+    missing_columns = validate_columns(mapped_df)
+    if missing_columns:
+        raise ValueError("Please map all required columns before continuing.")
 
-        st.session_state.processed_data = clean_data(mapped_df)
-        st.session_state.processed_data_key = processing_key
-
-    return st.session_state.processed_data.copy()
+    processed_df = clean_data(mapped_df)
+    del mapped_df
+    return processed_df
 
 
 def format_currency(value: float) -> str:
@@ -230,11 +247,50 @@ def format_percent(value: float) -> str:
     return f"{value * 100:,.2f}%"
 
 
+def get_filter_signature(filters: list[dict]) -> tuple:
+    """Use lightweight tuples as cache keys instead of storing filtered dataframes."""
+    signature = []
+    for item in filters:
+        signature.append(
+            (
+                item.get("type"),
+                tuple(item.get("data", [])),
+                item.get("token"),
+            )
+        )
+    return tuple(signature)
+
+
+@st.cache_data(show_spinner=False)
+def get_filtered_data(
+    source_signature: str,
+    mapping_signature: tuple[tuple[str, str], ...],
+    filter_signature: tuple,
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    # Filtering is cached because every Streamlit widget rerun would otherwise
+    # repeat boolean masks/grouping over the full dataset.
+    del source_signature, mapping_signature
+    filters = [
+        {"type": item[0], "data": list(item[1]), "token": item[2]}
+        for item in filter_signature
+    ]
+    return apply_filters(df, filters) if filters else df
+
+
+@st.cache_data(show_spinner=False)
+def get_distinct_values(df: pd.DataFrame, column: str) -> list:
+    # Cache dropdown/multiselect values; unique() can be expensive on large CSVs.
+    return sorted(df[column].dropna().unique().tolist())
+
+
+@st.cache_data(show_spinner=False)
 def build_kpis(
     filtered_df: pd.DataFrame,
     original_df: pd.DataFrame,
     clv_period: int | None,
 ) -> list[tuple[str, str]]:
+    # KPI operations group/nunique over large data; cache them per filtered set.
     if filtered_df.empty:
         return [
             ("Total Revenue", format_currency(0)),
@@ -296,7 +352,9 @@ def render_kpis(kpis: list[tuple[str, str]]) -> None:
             col.metric(label, value)
 
 
-def render_date_trend(df: pd.DataFrame, date_part: str, date_label: str) -> None:
+@st.cache_data(show_spinner=False)
+def get_date_trend_data(df: pd.DataFrame, date_part: str) -> pd.DataFrame:
+    # Aggregate before plotting; chart functions should never consume raw rows.
     month_labels = {
         1: "Jan",
         2: "Feb",
@@ -311,8 +369,12 @@ def render_date_trend(df: pd.DataFrame, date_part: str, date_label: str) -> None
         11: "Nov",
         12: "Dec",
     }
-    chart_df = df.copy()
-    chart_df[date_part] = getattr(chart_df["date"].dt, date_part)
+    chart_df = pd.DataFrame(
+        {
+            date_part: getattr(df["date"].dt, date_part),
+            "total_price": df["total_price"],
+        }
+    )
     chart_df = (
         chart_df.groupby(date_part, as_index=False)["total_price"]
         .sum()
@@ -323,9 +385,52 @@ def render_date_trend(df: pd.DataFrame, date_part: str, date_label: str) -> None
         chart_df[date_part] = chart_df[date_part].map(month_labels)
     else:
         chart_df[date_part] = chart_df[date_part].astype(str)
+    return chart_df
 
+
+@st.cache_data(show_spinner=False)
+def get_product_bar_data(
+    df: pd.DataFrame,
+    top_or_bottom: str,
+    n: int,
+) -> pd.DataFrame:
+    # Limit to top/bottom N before rendering to avoid large chart payloads.
+    product_df = top_bottom(
+        df,
+        top_or_bottom=top_or_bottom,
+        n=n,
+        on="product",
+        metric="total_price",
+    ).reset_index()
+    return product_df
+
+
+@st.cache_data(show_spinner=False)
+def get_customer_mix_data(df: pd.DataFrame) -> tuple[float, float]:
+    # Repeat-customer segmentation is cached because it groups by customer/date.
+    customers = total_customers(df)
+    has_date_values = "date" in df.columns and df["date"].notna().any()
+    return repeat_customer(df) if customers and has_date_values else (0, 0)
+
+
+@st.cache_data(show_spinner=False)
+def get_metric_view_data(df: pd.DataFrame, metric: str, view_type: str) -> pd.DataFrame:
+    # Metric-wise aggregations are cached and capped by helper functions.
+    if view_type == "average_order_value":
+        return metric_wise_average_order_value(df, metric).sort_values(
+            "average_order_value",
+            ascending=False,
+        )
+    return revenue_contib_by_metric(df, metric).sort_values(
+        "revenue_contribution",
+        ascending=False,
+    )
+
+
+def render_date_trend(df: pd.DataFrame, date_part: str, date_label: str) -> None:
+    chart_df = get_date_trend_data(df, date_part)
     fig, ax = plt.subplots(figsize=(12, 5))
-    sns.lineplot(data=chart_df, x=date_part, y="total_price", marker="o", ax=ax)
+    ax.plot(chart_df[date_part], chart_df["total_price"], marker="o")
     ax.set_xlabel(date_label)
     ax.set_ylabel("Revenue")
     ax.set_title(f"Revenue Trend by {date_label} ({date_part.title()})")
@@ -335,16 +440,11 @@ def render_date_trend(df: pd.DataFrame, date_part: str, date_label: str) -> None
 
 
 def render_product_bar(df: pd.DataFrame, top_or_bottom: str, product_label: str) -> None:
-    product_df = top_bottom(
-        df,
-        top_or_bottom=top_or_bottom,
-        n=10,
-        on="product",
-        metric="total_price",
-    ).reset_index()
+    product_df = get_product_bar_data(df, top_or_bottom, 10)
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    sns.barplot(data=product_df, x="total_price", y="product", ax=ax)
+    ax.barh(product_df["product"].astype(str), product_df["total_price"])
+    ax.invert_yaxis()
     ax.set_xlabel("Revenue")
     ax.set_ylabel(product_label)
     ax.set_title(f"{top_or_bottom.title()} 10 {product_label} by Revenue")
@@ -353,11 +453,7 @@ def render_product_bar(df: pd.DataFrame, top_or_bottom: str, product_label: str)
 
 
 def render_customer_mix(df: pd.DataFrame) -> None:
-    customers = total_customers(df)
-    has_date_values = "date" in df.columns and df["date"].notna().any()
-    new_customers, returning_customers = (
-        repeat_customer(df) if customers and has_date_values else (0, 0)
-    )
+    new_customers, returning_customers = get_customer_mix_data(df)
 
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.pie(
@@ -373,20 +469,18 @@ def render_customer_mix(df: pd.DataFrame) -> None:
 
 def render_metric_view(df: pd.DataFrame, metric: str, metric_label: str, view_type: str) -> None:
     if view_type == "average_order_value":
-        metric_df = metric_wise_average_order_value(df, metric)
+        metric_df = get_metric_view_data(df, metric, view_type)
         value_col = "average_order_value"
         y_label = "Average Order Value"
         title = f"Average Order Value by {metric_label}"
     else:
-        metric_df = revenue_contib_by_metric(df, metric)
+        metric_df = get_metric_view_data(df, metric, view_type)
         value_col = "revenue_contribution"
         y_label = "Revenue Contribution (%)"
         title = f"Revenue Contribution by {metric_label}"
 
-    metric_df = metric_df.sort_values(value_col, ascending=False)
-
     fig, ax = plt.subplots(figsize=(12, 5))
-    sns.barplot(data=metric_df, x=metric, y=value_col, ax=ax)
+    ax.bar(metric_df[metric].astype(str), metric_df[value_col])
     ax.set_xlabel(metric_label)
     ax.set_ylabel(y_label)
     ax.set_title(title)
@@ -545,6 +639,12 @@ if selected_source == "Upload CSV":
         st.stop()
 
     uploaded_bytes = uploaded_file.getvalue()
+    if len(uploaded_bytes) > MAX_UPLOAD_SIZE_BYTES:
+        st.error(
+            f"Uploaded file is too large for this Render deployment. "
+            f"Please upload a file under {MAX_UPLOAD_SIZE_MB} MB."
+        )
+        st.stop()
     uploaded_df = read_uploaded_csv(uploaded_bytes)
     source_name = uploaded_file.name
     source_signature = f"upload:{uploaded_file.name}:{len(uploaded_bytes)}"
@@ -558,8 +658,6 @@ if st.session_state.get("source_signature") != source_signature:
     st.session_state.source_signature = source_signature
     st.session_state.mapping_locked = False
     st.session_state.column_mapping = {}
-    st.session_state.pop("processed_data", None)
-    st.session_state.pop("processed_data_key", None)
     for required_column in REQUIRED_COLUMNS:
         st.session_state.pop(f"map_{required_column}", None)
 
@@ -586,10 +684,16 @@ if not st.session_state.get("mapping_locked", False):
 column_mapping = st.session_state.column_mapping
 available_columns = get_available_columns(column_mapping)
 
-df = get_processed_data(source_signature, uploaded_df, column_mapping)
+mapping_signature = get_mapping_signature(column_mapping)
+try:
+    df = get_processed_data(source_signature, uploaded_df, mapping_signature)
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
 st.caption(f"Using file: {source_name}")
 
-original_df = df.copy()
+# Keep a reference instead of duplicating the full dataframe in memory.
+original_df = df
 
 if df.empty:
     st.error("No usable rows found. Please upload a CSV with valid values.")
@@ -615,14 +719,14 @@ if has_date:
     year_min = int(df["date"].dt.year.min())
     year_max = int(df["date"].dt.year.max())
 if has_country:
-    countries = ["All"] + sorted(df["Country"].dropna().unique().tolist())
+    countries = ["All"] + get_distinct_values(df, "Country")
 if has_product:
-    products = sorted(df["product"].dropna().unique().tolist())
+    products = get_distinct_values(df, "product")
 if has_age:
     age_min = int(df["Age"].min())
     age_max = int(df["Age"].max())
 if has_gender:
-    genders = sorted(df["Gender"].dropna().unique().tolist())
+    genders = get_distinct_values(df, "Gender")
 
 sync_filter_state()
 
@@ -687,7 +791,8 @@ for filter_name, filter_col in zip(filter_slots, filter_cols):
         elif filter_name == "year":
             filters.append(date_filter_control(f"{date_label} Year", "year", year_min, year_max))
 
-filtered_df = apply_filters(df, filters) if filters else df
+filter_signature = get_filter_signature(filters)
+filtered_df = get_filtered_data(source_signature, mapping_signature, filter_signature, df)
 
 with st.expander("Current filter JSON"):
     st.json(filters)

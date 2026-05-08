@@ -1,5 +1,4 @@
 import pandas as pd
-import seaborn as sns 
 import matplotlib.pyplot as plt
 
 def date_wise_trends(df, date_part, on=None, metric=None):
@@ -33,7 +32,7 @@ def date_wise_trends(df, date_part, on=None, metric=None):
     if date_part == "month":
         year_group[date_part] = year_group[date_part].map(month_name)
 
-    sns.lineplot(data=year_group, x=date_part, y=on, marker="o")
+    plt.plot(year_group[date_part], year_group[on], marker="o")
     plt.savefig("./plots/date_wise_trends.png", dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -56,7 +55,6 @@ def top_bottom(df, top_or_bottom = None, n = None, on = None, metric = None):
     
 
 def pie_char(new_customers, returning_customers):
-    sns.set_style("whitegrid")
     lables = ["New Customers", "Returning Customers"]
     sizes = [new_customers, returning_customers]
     plt.figure(figsize=(6,6))
