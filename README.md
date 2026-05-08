@@ -1,5 +1,5 @@
 #### Live Demo Link
-https://kunal-dagar-2002-automated-analytics-app-kkesai.streamlit.app/
+https://kunal-dagar-2002-automated-analytics-app-eb1bmg.streamlit.app/
 
 # Automated Analytics Dashboard
 
